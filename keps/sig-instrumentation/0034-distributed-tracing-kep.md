@@ -37,12 +37,16 @@ status: provisional
     - [Propagating Context Through Objects](#propagating-context-through-objects)
     - [Controller Behavior](#controller-behavior)
     - [End-User Behavior](#end-user-behavior)
+    - [Concurrent Updates](#concurrent-updates)
   - [In-tree changes](#in-tree-changes)
+    - [Plumbing Context in Client-go](#plumbing-context-in-client-go)
     - [Vendor the Tracing Framework](#vendor-the-tracing-framework)
     - [Trace Utility Package](#trace-utility-package)
+    - [Tracing kube-apiserver requests](#tracing-kube-apiserver-requests)
     - [Tracing Pod Lifecycle](#tracing-pod-lifecycle)
   - [Out-of-tree changes](#out-of-tree-changes)
     - [Tracing best-practices documentation](#tracing-best-practices-documentation)
+  - [Abuse potential](#abuse-potential)
 - [Graduation requirements](#graduation-requirements)
 - [Production Readiness Survey](#production-readiness-survey)
 - [Implementation History](#implementation-history)
@@ -117,15 +121,13 @@ When reconciling an object `Foo` a Controller must:
 1. Send the trace context stored in `Foo` in the http request context for all API requests. See [Tracing API Requests](#tracing-api-requests)
 1. Store the trace context of `Foo` in object `Bar` when updating the Spec of `Bar`. See [Propagating Context Through Objects](#propagating-context-through-objects)
 1. Export a span around work that attempts to drive the actual state of an object towards its desired state
-1. Replace the trace context of `Foo` when updating `Foo`'s status to the desired state
+1. Remove the trace context of `Foo` when updating `Foo`'s status to the desired state
 
 Controllers must _only_ export Spans around work that it is correcting from an undesired state to its desired state.  To avoid exporting pointless spans, controllers must not export spans around reconciliation loops that do not perform actual work.  For example, the kubelet must not export a span around syncPod, which is a generic Reconcile function.  Instead, it should export spans around CreateContainer, or other functions that move the system towards its desired state. 
 
 This proposal is grounded on the principle that a trace context is attached to and propagated with end-user intent.  When the status of an object is updated to its desired state, the end-user's intent for that object has been fulfilled.  Controllers must "end" tracing for an object when it reaches its desired state.  To accomplish this, Controllers must update the trace context of an object when updating the status of an object from an undesired to a desired state.  For objects that report a status that can reach a desired state, this limits traces to just the actions taken by controllers in the fulfillment of the end-user's intent, and prevents traces from spanning an indefinite period of time.
 
 Components should plumb the context through reconciliation functions, rather than storing and looking up trace contexts globally so that each attempt to reconcile desired and actual state uses the context associated with _that_ desired state through the entire attempt.  If multiple components are involved in reconciling a single object, one may act on the new trace context before the other, but each trace is still representative of the work done to reconcile to the corresponding desired state. Given this model, we guarantee that each trace contains the actions taken to reconcile toward a single desired state.
-
-High-level processes, such as starting a pod or restarting a failed container, could be interrupted before completion by an update to the desired state. While this leaves a "partial" trace for the first process, it is the most accurate representation of the work and timing of reconciling desired and actual state.
 
 #### End-User Behavior
 
@@ -149,7 +151,15 @@ A previous iteration of this proposal suggested controllers should export a "Roo
 
 Tracing in a kubernetes cluster must be a composable component within a larger system, and allow external users or systems to define the "Root Span" that defines and bounds the scope of a trace.
 
+#### Concurrent Updates
+
+It is possible that a user or controller will update an object before it has reached its desired state.  In this case, the SpanContext will be overwritten, and the trace for the previous request will be incomplete.  To mitigate this, when overwriting SpanContext A with SpanContext B, the updating process should create a [Link](https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/overview.md#links-between-spans) from Span A to Span B.  This ensures the trace containing span A only includes spans resulting from the user's initial action, but allows investigating subsequent actions taken by controllers that _may_ have been a result of the initial action by looking at the linked span.
+
 ### In-tree changes
+
+#### Plumbing Context in Client-go
+
+To allow users of client-go to easily propagate context to http requests to the API Server, golang's context.Context will be added to all CRUD methods in client-go.  This excludes informer-based operations.
 
 #### Vendor the Tracing Framework
 
@@ -185,6 +195,10 @@ func EncodeContextIntoObject(ctx context.Context, obj meta.Object)
 func RemoveSpanContextFromObject(obj meta.Object) 
 ```
 
+#### Tracing kube-apiserver requests
+
+We wrap the http server with [othttp](https://github.com/open-telemetry/opentelemetry-go/tree/master/plugin/othttp) to get spans for incoming requests, and add the [otgrpc](https://github.com/grpc-ecosystem/grpc-opentracing/tree/master/go/otgrpc) DialOption to the etcd grpc client.
+
 #### Tracing Pod Lifecycle
 
 As we move forward with this KEP, we will use the aforementioned trace utility package to trace pod-related operations across the scheduler and kubelet. In code, this corresponds to creating a span (i.e. `ctx, span := trace.StartSpan(ctx, "Component.SampleSpan")`) at the beginning of an operation, and ending the span afterwards (`span.End()`). All calls to tracing functions will be gated with the `ObjectLifecycleTracing` alpha feature-gate, and will be disabled by default.
@@ -211,6 +225,14 @@ This documentation will put forward standards for:
 
 Having these standards in place will ensure that our tracing instrumentation works well with all backends, and that reviewers have concrete criteria to cross-check PRs against. 
 
+### Abuse potential
+
+Using objects to propagate SpanContext comes with some drawbacks.  In particular,
+
+1. Anyone with Read (get, list, watch) access to a traced object and permission to write to the trace backend can append spans to a trace.  There is not a simple way to verify that a Span was written by a particular component.
+1. Anyone with Read (get, list, watch) access to a traced object and permission to write to the trace backend can add disconnected (without a parent span) spans to a trace.  The behavior when this occurs is undefined (and may vary between tracing backends), but may result in the disconnected span tree being displayed instead of the actual span tree.
+1. Anyone with Write (create, update) access to a traced object can remove the SpanContext or set it as not sampled to prevent controllers from writing traces for the object.
+
 ## Graduation requirements
 
 Alpha
@@ -225,6 +247,7 @@ Beta
 - [] Security Review, including threat model
 - [] Deployment review including whether the [OT Collector](https://github.com/open-telemetry/opentelemetry-collector) is a required component
 - [] Benchmark kubernetes components using tracing, and determine resource requirements and scaling for any additional required components (e.g. OT Collector).
+- [] Scalability testing for high-qps components, including kube-apiserver
 
 GA
 
