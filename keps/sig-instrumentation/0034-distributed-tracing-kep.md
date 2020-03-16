@@ -15,10 +15,9 @@ reviewers:
   - "@bogdandrutu"
 approvers:
   - "@brancz"
-  - "@piosz"
 creation-date: 2018-12-04
-last-updated: 2019-11-07
-status: provisional
+last-updated: 2020-03-16
+status: implementable
 ---
 
 # Leveraging Distributed Tracing to Understand Kubernetes Object Lifecycles
@@ -41,6 +40,7 @@ status: provisional
   - [In-tree changes](#in-tree-changes)
     - [Plumbing Context in Client-go](#plumbing-context-in-client-go)
     - [Vendor the Tracing Framework](#vendor-the-tracing-framework)
+    - [Controlling use of the OpenTelemetry library](#controlling-use-of-the-opentelemetry-library)
     - [Trace Utility Package](#trace-utility-package)
     - [Tracing kube-apiserver requests](#tracing-kube-apiserver-requests)
     - [Tracing Pod Lifecycle](#tracing-pod-lifecycle)
@@ -85,6 +85,7 @@ Distributed tracing provides a single window into latency information from acros
 
 * Replace existing logging, metrics, or the events API
 * Trace operations from all Kubernetes resource types in a generic manner (i.e. without manual instrumentation)
+* Change metrics or logging (e.g. to support trace-metric correlation)
 
 ## Proposal
 
@@ -175,6 +176,10 @@ This KEP suggests that we utilize the OpenTelemetry collector for the initial im
 2. Support *both* a curated set of in-tree exporters, and the collector exporter
 
 While this setup is suitable for an alpha stage, it will require further review from Sig-Instrumentation and Sig-Architecture for beta, as it introduces a dependency on the OT Collector.  It is also worth noting that OpenTelemetry still has many unresolved details on how to run the collector.
+
+#### Controlling use of the OpenTelemetry library
+
+As the community found in the [Metrics Stability Framework KEP](https://github.com/kubernetes/enhancements/blob/master/keps/sig-instrumentation/20190404-kubernetes-control-plane-metrics-stability.md#kubernetes-control-plane-metrics-stability), having control over how the client libraries are used in kubernetes can enable maintainers to enforce policy and make broad improvements to the quality of telemetry.  To enable future improvements to tracing, we will restrict the direct use of the OpenTelemetry library within the kubernetes code base, and provide wrapped versions of functions we wish to expose in a utility library.
 
 #### Trace Utility Package
 
