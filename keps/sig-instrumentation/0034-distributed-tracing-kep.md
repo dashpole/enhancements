@@ -2,6 +2,7 @@
 title: Leveraging Distributed Tracing to Understand Kubernetes Object Lifecycles
 authors:
   - "@Monkeyanator"
+  - "@dashpole"
 editor: "@dashpole"
 owning-sig: sig-instrumentation
 participating-sigs:
@@ -16,7 +17,7 @@ reviewers:
 approvers:
   - "@brancz"
 creation-date: 2018-12-04
-last-updated: 2020-03-16
+last-updated: 2020-04-16
 status: implementable
 ---
 
@@ -34,20 +35,26 @@ status: implementable
   - [Architecture](#architecture)
     - [Tracing API Requests](#tracing-api-requests)
     - [Propagating Context Through Objects](#propagating-context-through-objects)
+    - [End-User Interaction](#end-user-interaction)
     - [Controller Behavior](#controller-behavior)
-    - [End-User Behavior](#end-user-behavior)
-    - [Concurrent Updates](#concurrent-updates)
+      - [Choosing a Parent Object, and Reading the Context](#choosing-a-parent-object-and-reading-the-context)
+      - [Emitting Spans from Controllers](#emitting-spans-from-controllers)
+    - [Writing the Trace Context Annotation: The Tracing Admission Controller](#writing-the-trace-context-annotation-the-tracing-admission-controller)
   - [In-tree changes](#in-tree-changes)
     - [Plumbing Context in Client-go](#plumbing-context-in-client-go)
-    - [Vendor the Tracing Framework](#vendor-the-tracing-framework)
+    - [Vendor OpenTelemetry and the OT Exporter](#vendor-opentelemetry-and-the-ot-exporter)
     - [Controlling use of the OpenTelemetry library](#controlling-use-of-the-opentelemetry-library)
     - [Trace Utility Package](#trace-utility-package)
     - [Tracing kube-apiserver requests](#tracing-kube-apiserver-requests)
-    - [Tracing Pod Lifecycle](#tracing-pod-lifecycle)
   - [Out-of-tree changes](#out-of-tree-changes)
     - [Tracing best-practices documentation](#tracing-best-practices-documentation)
-  - [Abuse potential](#abuse-potential)
+- [Access Control](#access-control)
 - [Graduation requirements](#graduation-requirements)
+- [Alternatives considered](#alternatives-considered)
+  - [Object &quot;Root Spans&quot;](#object-root-spans)
+  - [Other OpenTelemetry Exporters](#other-opentelemetry-exporters)
+  - [Controllers Update TraceContext Annotation, instead of Admission Controller](#controllers-update-tracecontext-annotation-instead-of-admission-controller)
+  - [Using ObjectRef + Generation instead of an OT TraceContext](#using-objectref--generation-instead-of-an-ot-tracecontext)
 - [Production Readiness Survey](#production-readiness-survey)
 - [Implementation History](#implementation-history)
 <!-- /toc -->
@@ -66,13 +73,13 @@ Debugging latency issues in Kubernetes is an involved process. There are existin
 * **Latency metrics**: can only supply limited metadata because of cardinality constraints.  They are useful for showing _that_ a process was slow, but don't provide insight into _why_ it was slow.
 * **Latency Logging**: is a "poor man's" version of tracing that only works within a single binary and outputs log messages.  See [github.com/kubernetes/utils/trace](https://github.com/kubernetes/utils/tree/master/trace).
 
-Distributed tracing provides a single window into latency information from across many components and plugins. Trace data is structured, and there are numerous established backends for visualizing and querying over it.
+Distributed tracing provides a unified view of latency information from across many components and plugins. Trace data is structured, and there are numerous established backends for visualizing and querying over it.
 
 ### Definitions
 
 **Span**: The smallest unit of a trace.  It has a start and end time, and is attached to a single trace.
 **Trace**: A collection of Spans which represents a single process.
-**Trace Context**: A reference to a Trace that is designed to be propagated across component boundaries.
+**Trace Context**: A reference to a Trace that is designed to be propagated across component boundaries.  Sometimes referred to as the "Span Context".
 
 ### Goals
 
@@ -86,6 +93,7 @@ Distributed tracing provides a single window into latency information from acros
 * Replace existing logging, metrics, or the events API
 * Trace operations from all Kubernetes resource types in a generic manner (i.e. without manual instrumentation)
 * Change metrics or logging (e.g. to support trace-metric correlation)
+* Access control to tracing backends
 
 ## Proposal
 
@@ -93,46 +101,24 @@ Distributed tracing provides a single window into latency information from acros
 
 #### Tracing API Requests
 
-In the traditional tracing model, a client sends a request to a server and receives a response back.  Even though Kubernetes "controllers" don't follow this model (more on that later), the kube-apierver and backing storage (e.g. etcd3) do.  To enable traces to be collected for API requests, the following must be true:
+In the traditional tracing model, a client sends a request to a server and receives a response back.  The kube-apierver and backing storage (e.g. etcd3) follow this model, so we can easily add tracing for API Server requests.  To enable traces to be collected for API requests, the following must be true:
 
 1. The apiserver must propagate the http context of incoming requests through its function stack to the backing storage
 1. Kubernetes client libraries must allow passing a context with API requests
 
-To actually add traces to API requests, owners of the kube-apiserver and backing storage may add Spans to incoming requests, and configure sampling as they see fit.
+To add traces to API requests, owners of the kube-apiserver and backing storage may add Spans to incoming requests, and configure sampling as they see fit.
 
 #### Propagating Context Through Objects
 
-While API requests follow the traditional RPC client-server tracing model, kubernetes controllers don't.  Instead of controller actions being driven by incoming RPCs, their actions are driven by observations of desired and actual state.  This is the primary reason why the kubernetes community hasn't agreed on how to integrate tracing into kubernetes thus far.
+Unlike the traditional RPC model, controllers in kubernetes do not communicate directly with each other directly over HTTP.  Thus, we cannot use http headers to propagate the context between controllers.  Instead, controllers write to and read from objects.  To propagate the trace context from object writer to object reader, we will store the context as an encoded string an object annotation: `<{alpha.|beta.|}trace.kubernetes.io/context`.  For how the annotaiton is written, see the [Writing the Trace Context Annotation: The Tracing Admission Controller](#writing-the-trace-context-annotation-the-tracing-admission-controller) section below.
 
-In the traditional RPC client-server tracing model, a trace context is attached to a single incoming request, and is propagated with all requests the server makes to other servers required to fulfill the initial single request.  Conceptually, this proposal suggests treating a kubernetes cluster as a single RPC server.  The difference is that we attach context to objects, and propagate this context to objects modified as a result of the initial object modification.  For example, if a user creates a ReplicaSet, the kube-controller-manager will create many Pod objects as a result, and will propagate the context used to create the ReplicaSet to Pod objects as well.  This ensures that all actions taken by kubernetes controllers as a result of the initial user action are linked by the same context.
+This means two trace contexts are sent in different forms with Create/Patch/Update requests to the apiserver (one in http headers, one in an annotation).  A trace context is around 32 bytes (16 bytes for the trace ID, 8 bytes for the span ID, and some metadata). See the [w3c spec](https://w3c.github.io/trace-context/#tracestate-field) for details.
 
-For the alpha phase, we choose to propagate this span context as an encoded string an object annotation called `trace.kubernetes.io/context`.  As noted in [Tracing API Requests](#tracing-api-requests) above, storing the trace context with the context is _in addition_ to attaching a context to http requests to the apiserver.  The reason for this is explained in the [Controller Behavior](#controller-behavior) section below.  In some scenarios, controllers will want to update the trace context from A -> B, but want to associated that Update request with context A.
+#### End-User Interaction
 
-This means two trace contexts are sent in different forms with Create/Patch/Update requests to the apiserver.  A trace context is around 32 bytes (16 bytes for the trace ID, 8 bytes for the span ID, and some metadata). See the [w3c spec](https://w3c.github.io/trace-context/#tracestate-field) for details.
+Fundamentally, a trace is a graph showing the fulfilment of user intent.  To make tracing in kubernetes useful, we need to ensure users have the ability to declare their intent for their write to be traced by controllers.
 
-
-This annotation value is removed when an object's trace ends, to achieve the desired behavior from [section one](#trace-lifecycle).  For core kubernetes components, this must be done in the same request to the API Server as the status update which updates the object to its desired state.  This is a requirement to ensure tracing does not affect the scalability of kubernetes.  For other components, it is recommended, but not required to update the trace annotation in the same request.
-
-This proposal chooses to use annotations to store the SpanContext associated with an object.  This mirrors how trace context propagation is done with golang context.Context and http headers, which are both key/value stores.
-
-#### Controller Behavior
-
-When reconciling an object `Foo` a Controller must:
-
-1. Send the trace context stored in `Foo` in the http request context for all API requests. See [Tracing API Requests](#tracing-api-requests)
-1. Store the trace context of `Foo` in object `Bar` when updating the Spec of `Bar`. See [Propagating Context Through Objects](#propagating-context-through-objects)
-1. Export a span around work that attempts to drive the actual state of an object towards its desired state
-1. Remove the trace context of `Foo` when updating `Foo`'s status to the desired state
-
-Controllers must _only_ export Spans around work that it is correcting from an undesired state to its desired state.  To avoid exporting pointless spans, controllers must not export spans around reconciliation loops that do not perform actual work.  For example, the kubelet must not export a span around syncPod, which is a generic Reconcile function.  Instead, it should export spans around CreateContainer, or other functions that move the system towards its desired state. 
-
-This proposal is grounded on the principle that a trace context is attached to and propagated with end-user intent.  When the status of an object is updated to its desired state, the end-user's intent for that object has been fulfilled.  Controllers must "end" tracing for an object when it reaches its desired state.  To accomplish this, Controllers must update the trace context of an object when updating the status of an object from an undesired to a desired state.  For objects that report a status that can reach a desired state, this limits traces to just the actions taken by controllers in the fulfillment of the end-user's intent, and prevents traces from spanning an indefinite period of time.
-
-Components should plumb the context through reconciliation functions, rather than storing and looking up trace contexts globally so that each attempt to reconcile desired and actual state uses the context associated with _that_ desired state through the entire attempt.  If multiple components are involved in reconciling a single object, one may act on the new trace context before the other, but each trace is still representative of the work done to reconcile to the corresponding desired state. Given this model, we guarantee that each trace contains the actions taken to reconcile toward a single desired state.
-
-#### End-User Behavior
-
-Add a new `--trace` argument to `kubectl`, which generates a new trace context, sets the trace context to be sampled, attaches the context to all modified objects, and uses the context when sending requests to the API Server.  The option is disabled by default.  Note that by attaching a trace context to the initial object creation, this will cause all object modification done by controllers to propagate the context through to all changes made by the system that are driven by the initial user action.
+Add a new `--trace` argument to `kubectl`, which generates a new trace context, sets the trace context to be sampled, and uses the context when sending requests to the API Server.  The option is false by default.
 
 Add `context.Context` arguments to k8s.io/client-go client functions.  This will allow users and components to associate API calls with the context of the involved object.  In some cases, such as object creation, we can automatically attach the SpanContext of the provided context to the created object, making propagation simpler.
 
@@ -148,13 +134,98 @@ waitForPodToBeRunning(ctx, myPod)
 return nil
 ```
 
-A previous iteration of this proposal suggested controllers should export a "Root Span" when ending a trace (described in [Controller Behavior](#controller-behavior) above).  However, that would limit a trace to being associated with a single object, since a "Root Span" defines the scope of the trace.  More generally, we shouldn't assume that the creation or update of a single object represents the entirety of end-user intent.  The user or system using kubernetes determines what the user intent is, not kubernetes controllers.
+#### Controller Behavior
 
-Tracing in a kubernetes cluster must be a composable component within a larger system, and allow external users or systems to define the "Root Span" that defines and bounds the scope of a trace.
+##### Choosing a Parent Object, and Reading the Context
 
-#### Concurrent Updates
+In the traditional RPC client-server tracing model, a server responds to an incoming request by performing actions including sending outgoing requests.  The server "propagates" the trace context of the incoming request by attaching it to all outgoing requests, forming a tree of requests.  In kubernetes, instead of work being driven by a single incoming request, controllers observe the state of many objects, and perform actions including writing to objects.  Unlike the traditional RPC model, a given controller action is often the result of writes from _multiple_ other controllers.  In order to form a tree from work done by controllers, a given controller action must be attributed to a single parent object.
 
-It is possible that a user or controller will update an object before it has reached its desired state.  In this case, the SpanContext will be overwritten, and the trace for the previous request will be incomplete.  To mitigate this, when overwriting SpanContext A with SpanContext B, the updating process should create a [Link](https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/overview.md#links-between-spans) from Span A to Span B.  This ensures the trace containing span A only includes spans resulting from the user's initial action, but allows investigating subsequent actions taken by controllers that _may_ have been a result of the initial action by looking at the linked span.
+As stated in [End-User Interaction](#end-user-interaction), a trace is a graph of the **fulfilment** of user intent.  In kubernetes, the fulfilment of user intent can be restated as the process of moving objects to their desired state.  To take v1.Pod as an example, the intent of the user/component that created the pod has been fulfilled when the pod's status moves to Running.  Therefore, an object trace in kubernetes should produce a graph of the process of moving the object from its current state to its desired state.  This means **controllers should associate a given action with the object whose state would be updated by that action**.  For example, when the scheduler assigns a pod to a node, it interacts with many objects, including Pod, Node, Binding, ResourceQuota, and others.  Using the proposed model of controller tracing, the scheduler associates process of scheduling with the Pod object, since that is the object which is moved towards its desired state.  This solves our dilema above, as it gives us a rule for associating an action with a single parent object, and allows us to form a tree of controller actions.
+
+To choose a parent object for a set of actions, controllers must be able to read the context stored in the object.  To do this, we will provide a utility function 
+```golang 
+trace.WithObject(ctx context.Context, obj meta.Object) context.Context
+```
+, which can be used to get the context from a parent object.  For example:
+
+```golang
+func CreateChildOfMyParent(ctx context.Context, kubeclient *clientset.Interface, myParent, myObj myv1.MyObject) {
++ ctx = trace.WithObject(ctx, myParent)
+  // Use the context in kubernetes API requests
+  kubeclient.MyV1().MyObject().Create(ctx, myObj)
+  // Use the context in http requests
+  req, _ := http.NewRequest(...)
+  req = req.WithContext(ctx)
+  tr.RoundTrip(req)
+  // Use the context in grpc requests
+  grpc.DialContext(ctx, ...)
+}
+```
+
+The single additional line above causes all actions performed with `ctx` to use the myParent object's trace context.  For tracing, this causes Spans to be children of the parent object's traceContext.
+
+##### Emitting Spans from Controllers
+
+Some controllers may want to add spans around work they perform in addition to propagating context.  If there were two `myObj` created from the `myParent` object in the example above, that would produce the following tree of spans if each of the servers (api server, http, and grpc) traces the requests:
+
+```
+parent
+ \_APICreate(myObj1)
+ |_APICreate(myObj2)
+ |_HttpReq(myObj1)
+ |_HttpReq(myObj2)
+ |_GrpcReq(myObj1)
+ |_GrpcReq(myObj2)
+```
+
+The tree has a single parent, with six children.  It would be helpful to be able to group these by each CreateChild call, and to be able to measure the latency of the overall CreateChild function from end-to-end.  It should look like:
+
+
+```
+parent
+ \_CreateChild(myObj1)
+ | \_APICreate(myObj1)
+ | |_HttpReq(myObj1)
+ | |_GrpcReq(myObj1)
+ |_CreateChild(myObj2)
+   \_APICreate(myObj2)
+   |_HttpReq(myObj2)
+   |_GrpcReq(myObj2)
+```
+
+To do this requires our controller to add a span around the function calls that should be grouped logically together.  We can achieve this by adding `trace.StartSpan` in our function above:
+
+```golang
+func CreateChildOfMyParent(ctx context.Context, kubeclient *clientset.Interface, myParent, myObj myv1.MyObject) {
+  ctx = trace.WithObject(ctx, myParent)
++ ctx, span := trace.StartSpan(ctx, "CreateChild")
++ defer span.End()
+  // Use the context in kubernetes API requests
+  kubeclient.MyV1().MyObject().Create(ctx, myObj)
+  // Use the context in http requests
+  req, _ := http.NewRequest(...)
+  req = req.WithContext(ctx)
+  tr.RoundTrip(req)
+  // Use the context in grpc requests
+  grpc.DialContext(ctx, ...)
+}
+```
+
+To configure trace exporting for the component, components can use a `trace.InitializeExporter` function:
+
+```golang
+func init() {
+  traceutil.InitializeTraceExporter("my-component")
+}
+```
+
+#### Writing the Trace Context Annotation: The Tracing Admission Controller
+
+The annotation will be added to objects by a mutating admission controller, referred to as the Tracing Admission Controller.  The API Server will propagate the context received in the API request with requests to admission controllers.  The Tracing Admission Controller will extract the trace context from the admission request, and encode it in the object.  If the previous context was sampled, it will preserve the sampling decision of the previous trace context in the new context.  If the new context belongs to a different trace, it will create a [Link](https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/overview.md#links-between-spans) between the spans.  This link enables viewers of an "Overwritten" trace context to follow the link to see the rest of the trace.
+
+The mutating admission controller will enforce that it is the only writer (by rejecting other updates) of the trace annotation to ensure the above behavior is enforced.
+
+Using a mutating admission controller simplifies the implementation for components, as they only need to send the context along with API Requests.  It also decreases the likelihood that components will not adhere to the guidelines around writing to the trace context annotation.
 
 ### In-tree changes
 
@@ -162,20 +233,11 @@ It is possible that a user or controller will update an object before it has rea
 
 To allow users of client-go to easily propagate context to http requests to the API Server, golang's context.Context will be added to all CRUD methods in client-go.  This excludes informer-based operations.
 
-#### Vendor the Tracing Framework
+#### Vendor OpenTelemetry and the OT Exporter
 
 This KEP proposes the use of the [OpenTelemetry tracing framework](https://opentelemetry.io/) to create and export spans to configured backends.
 
-While in alpha, controllers should use the OpenTelemetry exporter, which exports traces to the [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector). The OpenTelemetry collector allows importing and configuring exporters for trace storage backends to be done out-of-tree in addition to other useful features.
-
-This KEP suggests that we utilize the OpenTelemetry collector for the initial implementation to reduce the global changes required for alpha.  Alternative options include:
-
-1. Add configuration for exporters in-tree by vendoring in each "supported" exporter. These exporters are the only compatible backends for tracing in kubernetes.
-  a. This places the kubernetes community in the position of curating supported tracing backends
-  b. This eliminates the requirement to run to OpenTelemetry collector in order to use tracing
-2. Support *both* a curated set of in-tree exporters, and the collector exporter
-
-While this setup is suitable for an alpha stage, it will require further review from Sig-Instrumentation and Sig-Architecture for beta, as it introduces a dependency on the OT Collector.  It is also worth noting that OpenTelemetry still has many unresolved details on how to run the collector.
+Controllers must use the [OpenTelemetry exporter format](https://github.com/open-telemetry/opentelemetry-proto), which exports traces to a local port.  This format is compatible with the [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector), which allows importing and configuring exporters for trace storage backends to be done out-of-tree in addition to other useful features.
 
 #### Controlling use of the OpenTelemetry library
 
@@ -186,33 +248,20 @@ As the community found in the [Metrics Stability Framework KEP](https://github.c
 This package will be able to create spans from the span context embedded in the `trace.kubernetes.io/context` object annotation, in addition to embedding context from spans back into the annotation. This package will facilitate propagating traces through kubernetes objects.  The exported functions include:
 
 ```golang
-// InitializeExporter initializes the trace exporting service with the provided service name.
-// Components should use this initializer to ensure common behavior.
-func InitializeExporter(service string)
+// InitializeTraceExporter initializes the trace exporting service with the provided service name.
+// Components should use this initializer to ensure consistent behavior when configuring the trace exporter.
+func InitializeTraceExporter(service string)
 
-// StartSpanFromObject constructs a new Span using the context attached to the object as the parent SpanContext.  It mirrors trace.StartSpan, but for kubernetes objects.
-func StartSpanFromObject(ctx context.Context, obj meta.Object, spanName string) (context.Context, *trace.Span, error)
+// WithObject adds the trace context of obj to the Context
+func WithObject(ctx context.Context, obj meta.Object) context.Context
 
-// EncodeContextIntoObject encodes the SpanContext contained in the context into the object
-func EncodeContextIntoObject(ctx context.Context, obj meta.Object)
-
-// RemoveSpanContextFromObject removes the SpanContext attached to an object, if one exists
-func RemoveSpanContextFromObject(obj meta.Object) 
+// StartSpan is a wrapper around opentelemetry's trace.StartSpan function to control usage and enable future improvements.
+func StartSpan(ctx context.Context, spanName string) (context.Context, *ottrace.Span)
 ```
 
 #### Tracing kube-apiserver requests
 
 We wrap the http server with [othttp](https://github.com/open-telemetry/opentelemetry-go/tree/master/plugin/othttp) to get spans for incoming requests, and add the [otgrpc](https://github.com/grpc-ecosystem/grpc-opentracing/tree/master/go/otgrpc) DialOption to the etcd grpc client.
-
-#### Tracing Pod Lifecycle
-
-As we move forward with this KEP, we will use the aforementioned trace utility package to trace pod-related operations across the scheduler and kubelet. In code, this corresponds to creating a span (i.e. `ctx, span := trace.StartSpan(ctx, "Component.SampleSpan")`) at the beginning of an operation, and ending the span afterwards (`span.End()`). All calls to tracing functions will be gated with the `ObjectLifecycleTracing` alpha feature-gate, and will be disabled by default.
-
-OpenTelemetry ships with plugins to transport trace context across gRPC and HTTP boundaries, which enables us to extend our tracing across the CRI and other internal boundaries.
-
-In OpenTelemetry's Go implementation, span context is passed down through Go context. This will necessitate the threading of context across more of the Kubernetes codebase, which is a [desired outcome regardless](https://github.com/kubernetes/kubernetes/issues/815).
-
-While adding tracing to Pods is a good first step to demonstrate the viability of object lifecycle tracing in kubernetes, we expect component owners to add tracing to their components in an ad-hoc fashion.
 
 ### Out-of-tree changes
 
@@ -230,33 +279,57 @@ This documentation will put forward standards for:
 
 Having these standards in place will ensure that our tracing instrumentation works well with all backends, and that reviewers have concrete criteria to cross-check PRs against. 
 
-### Abuse potential
+## Access Control
 
-Using objects to propagate SpanContext comes with some drawbacks.  In particular,
+Access Control to trace storage backends is out of the scope of kubernetes.  Anyone with write access to the trace backend can create traces, attach additional spans to traces, or do other malicious things regardless of access to kubernetes objects.
 
-1. Anyone with Read (get, list, watch) access to a traced object and permission to write to the trace backend can append spans to a trace.  There is not a simple way to verify that a Span was written by a particular component.
-1. Anyone with Read (get, list, watch) access to a traced object and permission to write to the trace backend can add disconnected (without a parent span) spans to a trace.  The behavior when this occurs is undefined (and may vary between tracing backends), but may result in the disconnected span tree being displayed instead of the actual span tree.
-1. Anyone with Write (create, update) access to a traced object can remove the SpanContext or set it as not sampled to prevent controllers from writing traces for the object.
+That being said, using objects to propagate TraceContext potentially allows access to kubernetes objects to impact telemetry collected.  In particular, anyone with Write (create, update) access to a traced object can send a new TraceContext with a request to the API Server.  As described in [Concurrent Updates](#concurrent-updates), replacing the TraceContext will create a new trace, linked with the previous one.
 
 ## Graduation requirements
 
 Alpha
 
-- [] Alpha-implementation as described above
-- [] E2e testing of traces
+- [] Implement context propagation (not necessarily tracing) for all in-tree controllers as described in the [Controller Behavior](#controller-behavior) section.
+- [] Implement tracing of incoming and outgoing http/grpc requests in the kube-apiserver
+- [] Implement the Tracing Admission Controller
+- [] Add a `--trace` flag to kubectl
+- [] E2e testing of context propagation
 - [] User-facing documentation
-- [] Tracing must not increase the number of requests to the APIServer
+- [] Implement tracing in _some_ controllers and collect feedback
 
 Beta
 
-- [] Security Review, including threat model
-- [] Deployment review including whether the [OT Collector](https://github.com/open-telemetry/opentelemetry-collector) is a required component
-- [] Benchmark kubernetes components using tracing, and determine resource requirements and scaling for any additional required components (e.g. OT Collector).
+- [] Solve the "unlimited lifetime" problem for TraceContext
+- [] Benchmark kubernetes components using tracing
+- [] Publish documentation on examples of how to use the OT Collector with kubernetes
 - [] Scalability testing for high-qps components, including kube-apiserver
 
 GA
+- [] Document backwards-compatibility guarantees for Spans, if any
 
-- [] Versioning for span naming and backwards-compatibility guarantees
+## Alternatives considered
+
+### Object "Root Spans"
+
+A previous iteration of this proposal suggested controllers should export a "Root Span" when ending a trace (described in [Controller Behavior](#controller-behavior) above).  However, that would limit a trace to being associated with a single object, since a "Root Span" defines the scope of the trace.  More generally, we shouldn't assume that the creation or update of a single object represents the entirety of end-user intent.  The user or system using kubernetes determines what the user intent is, not kubernetes controllers.
+
+Tracing in a kubernetes cluster must be a composable component within a larger system, and allow external users or systems to define the "Root Span" that defines and bounds the scope of a trace.
+
+### Other OpenTelemetry Exporters
+
+This KEP suggests that we utilize the OpenTelemetry exporter format in all components.  Alternative options include:
+
+1. Add configuration for many exporters in-tree by vendoring multiple "supported" exporters. These exporters are the only compatible backends for tracing in kubernetes.
+  a. This places the kubernetes community in the position of curating supported tracing backends
+2. Support *both* a curated set of in-tree exporters, and the collector exporter
+
+### Controllers Update TraceContext Annotation, instead of Admission Controller
+
+This would remove the need to run a mutating admission controller.  However, this would add an extra line of code before each write to the API Server in controllers.  During Alpha, prioritize a smaller number of global code changes.  This can be revisited in future stages if necessary.
+
+### Using ObjectRef + Generation instead of an OT TraceContext 
+
+This would allow constructing a tree of spans by using the objectref + generation as the parent pointer.  Given a root object, a graph engine could reconstruct the tree of spans without needing the additional annotation.  However, this does not have a way to control sampling, and Object + Generation cannot be propagated to non-kubernetes components.  Using an open standard allows our telemetry to be interoperable with non-kubernetes components.
 
 ## Production Readiness Survey
 
